@@ -1,0 +1,12 @@
+## Copyright (C) 2023 - 2025 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
+## See the file COPYING for copying conditions.
+
+[Unit]
+Description=sys-init.target by security-misc
+
+After=sysinit.target
+Before=basic.target
+Requires=sysinit.target
+
+[Install]
+WantedBy=basic.target

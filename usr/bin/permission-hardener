@@ -1,0 +1,993 @@
+#!/bin/bash
+# shellcheck disable=SC2076
+
+## Copyright (C) 2012 - 2025 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
+## See the file COPYING for copying conditions.
+
+## https://forums.whonix.org/t/disable-suid-binaries/7706
+## https://forums.whonix.org/t/re-mount-home-and-other-with-noexec-and-nosuid-among-other-useful-mount-options-for-better-security/7707
+
+## dpkg-statoverride does not support end-of-options ("--").
+
+## SC2076 is disabled because ShellCheck seems to think that any use of
+## [[ ... =~ ... ]] is supposed to be a regex match. But [[ '...' =~ '...' ]]
+## works very well for literal matching, and it is used that way extensively
+## throughout this script.
+
+set -o errexit -o nounset -o pipefail
+
+## Constants
+# shellcheck disable=SC2034
+log_level=notice
+store_dir="/var/lib/permission-hardener-v2"
+state_file="${store_dir}/existing_mode/statoverride"
+dpkg_admindir_parameter_existing_mode="--admindir ${store_dir}/existing_mode"
+dpkg_admindir_parameter_new_mode="--admindir ${store_dir}/new_mode"
+delimiter="#permission-hardener-delimiter#"
+
+## Library imports
+# shellcheck disable=SC1091
+source /usr/libexec/helper-scripts/safe_echo.sh
+# shellcheck disable=SC1091
+source /usr/libexec/helper-scripts/log_run_die.sh
+
+## Functions
+echo_wrapper_ignore() {
+  if [ "${1}" = 'verbose' ]; then
+    shift
+    log notice "Executing: $*"
+  elif [ "${1}" = 'silent' ]; then
+    shift
+  else
+    log error "Unrecognized command '${1}'! calling function name: '${FUNCNAME[1]}'" >&2
+    return
+  fi
+  "$@" 2>/dev/null || true
+}
+
+echo_wrapper_audit() {
+  local return_code
+  if [ "${1}" = 'verbose' ]; then
+    shift
+    log notice "Executing: $*"
+  elif [ "${1}" = 'silent' ]; then
+    shift
+  else
+    log error "Unrecognized command '${1}'! calling function name: '${FUNCNAME[1]}'" >&2
+    return
+  fi
+  return_code=0
+  "$@" ||
+    {
+      return_code="$?"
+      exit_code=203
+      log error "Command '$*' failed with exit code '${return_code}'! calling function name: '${FUNCNAME[1]}'" >&2
+    }
+}
+
+## Some tools may fail on newlines and even variable assignment to array may
+## fail if a variable that will be assigned to an array element contains
+## characters that are used as delimiters.
+block_newlines() {
+  local newline_variable newline_value
+  newline_variable="${1:-}"
+  newline_value="${2:-}"
+  ## dpkg-statoverride: error: path may not contain newlines
+  if [[ "${newline_value}" != "${newline_value//$'\n'/NEWLINE}" ]]; then
+    log warn "Skipping ${newline_variable} that contains newlines: '${newline_value}'" >&2
+    return 1
+  fi
+}
+
+output_stat() {
+  local file_name stat_output stat_output_newlined hardlink_count
+  declare -a arr
+  file_name="${1:-}"
+
+  if [ -z "${file_name}" ]; then
+    log error "File name is empty. file_name: '${file_name}'" >&2
+    return 1
+  fi
+
+  block_newlines file "${file_name}"
+
+  if [ ! -e "${file_name}" ]; then
+    log info "File does not exist. file_name: '${file_name}'" >&2
+    existing_mode=''
+    existing_owner=''
+    existing_group=''
+    file_name_from_stat=''
+    return 0
+  fi
+
+  if ! stat_output="$(stat -L \
+    --format="%a${delimiter}%U${delimiter}%G${delimiter}%n${delimiter}%h${delimiter}" \
+    -- "${file_name}")"; then
+    log error "Failed to run 'stat' on file: '${file_name}'!" >&2
+    return 1
+  fi
+
+  if [ -z "$stat_output" ]; then
+    log error "stat_output is empty.
+File name: '${file_name}'
+Stat output: '${stat_output}'
+stat_output_newlined: '${stat_output_newlined}'
+line: '${processed_config_line}'
+" >&2
+    return 1
+  fi
+
+  stat_output_newlined="$(printf '%s\n' "${stat_output//${delimiter}/$'\n'}")"
+
+  if [ -z "${stat_output_newlined}" ]; then
+    log error "stat_output_newlined is empty.
+File name: '${file_name}'
+Stat output: '${stat_output}'
+stat_output_newlined: '${stat_output_newlined}'
+line: '${processed_config_line}'
+" >&2
+    return 1
+  fi
+
+  readarray -t arr <<< "${stat_output_newlined}"
+
+  if [ "${#arr[@]}" = '0' ]; then
+    log error "Array length is 0.
+File name: '${file_name}'
+Stat output: '${stat_output}'
+stat_output_newlined: '${stat_output_newlined}'
+line: '${processed_config_line}'
+" >&2
+    return 1
+  fi
+
+  existing_mode="${arr[0]}"
+  existing_owner="${arr[1]}"
+  existing_group="${arr[2]}"
+  file_name_from_stat="${arr[3]}"
+  hardlink_count="${arr[4]}"
+
+  if [ "$file_name" != "$file_name_from_stat" ]; then
+    log error "\
+File name is different from file name received from stat:
+File name: '${file_name}'
+File name from stat: '${file_name_from_stat}'
+line: '${processed_config_line}'
+" >&2
+    return 1
+  fi
+
+  ## We can't handle files with hardlinks because figuring out all of the files
+  ## in a "hardlink pool" requires scanning the whole filesystem, which would
+  ## result in an unacceptable performance hit for this script. We don't check
+  ## directory hardlinks since directories can't have traditional hardlinks.
+  if [ ! -d "${file_name_from_stat}" ]; then
+    if (( hardlink_count > 1 )); then
+      log error "\
+File has unexpected hardlinks, cannot handle.
+File name: '${file_name}'
+File name from stat: '${file_name_from_stat}'
+line: '${processed_config_line}'
+" >&2
+      return 1
+    fi
+  fi
+
+  if [ -z "${existing_mode}" ]; then
+    log error "Existing mode is empty. Stat output: '${stat_output}', line: '${processed_config_line}'" >&2
+    return 1
+  fi
+  if [ -z "${existing_owner}" ]; then
+    log error "Existing owner is empty. Stat output: '${stat_output}', line: '${processed_config_line}'" >&2
+    return 1
+  fi
+  if [ -z "${existing_group}" ]; then
+    log error "Existing group is empty. Stat output: '${stat_output}', line: '${processed_config_line}'" >&2
+    return 1
+  fi
+
+  ## If a symlink was passed as input, return the original file's path rather
+  ## than the symlink to avoid problems stemming from using the wrong path
+  if [ -h "${file_name_from_stat}" ]; then
+    file_name_from_stat="$(realpath "${file_name_from_stat}")"
+  fi
+}
+
+print_usage(){
+  safe_echo "Usage: ${0##*/} enable
+       ${0##*/} disable [FILE|all]
+       ${0##*/} print-policy
+       ${0##*/} print-state
+       ${0##*/} print-policy-applied-state
+       ${0##*/} print-diagnostics
+
+Examples:
+  ${0##*/} enable
+  ${0##*/} disable all
+  ${0##*/} disable /usr/bin/newgrp" >&2
+}
+
+add_to_policy() {
+  local file_name file_mode file_owner file_group updated_entry policy_idx \
+    file_capabilities
+  file_name="${1:-}"
+  file_mode="${2:-}"
+  file_owner="${3:-}"
+  file_group="${4:-}"
+  file_capabilities="${5:-}"
+  updated_entry=false
+
+  if [ -h "${file_name}" ]; then
+    file_name="$(realpath "${file_name}")" || return 1
+  fi
+
+  for (( policy_idx=0; policy_idx < ${#policy_file_list[@]}; policy_idx++ )); do
+    if [ "${policy_file_list[policy_idx]}" = "${file_name}" ]; then
+      policy_mode_list[policy_idx]="${file_mode}"
+      policy_user_owner_list[policy_idx]="${file_owner}"
+      policy_group_owner_list[policy_idx]="${file_group}"
+      policy_capability_list[policy_idx]="${file_capabilities}"
+      updated_entry=true
+      break
+    fi
+  done
+
+  if [ "${updated_entry}" != 'true' ]; then
+    policy_file_list+=( "${file_name}" )
+    policy_mode_list+=( "${file_mode}" )
+    policy_user_owner_list+=( "${file_owner}" )
+    policy_group_owner_list+=( "${file_group}" )
+    policy_capability_list+=( "${file_capabilities}" )
+  fi
+}
+
+check_nosuid_whitelist() {
+  local target_file match_white_list_entry
+
+  target_file="${1:-}"
+
+  ## Handle whitelists, if we're supposed to
+  [  "${whitelists_disable_all}" = 'true' ] && return 0
+
+  ## literal matching is intentional here
+  [[ " ${policy_disable_white_list[*]} " =~ " ${target_file} " ]] && return 0
+
+  ## literal matching is intentional here too
+  [[ " ${policy_exact_white_list[*]} " =~ " ${target_file} " ]] && return 1
+
+  for match_white_list_entry in "${policy_match_white_list[@]:-}"; do
+    if [[ "${target_file}" == *"${match_white_list_entry}"* ]]; then
+      return 1
+    fi
+  done
+
+  return 0
+}
+
+load_early_nosuid_policy() {
+  local target_file find_list_item
+
+  target_file="${1:-}"
+
+  # shellcheck disable=SC2185
+  while IFS="" read -r -d "" find_list_item; do
+    check_nosuid_whitelist "${find_list_item}" || continue
+
+    ## sets:
+    ## exiting_mode
+    ## existing_owner
+    ## existing_group
+    output_stat "${find_list_item}"
+    if [ -z "${file_name_from_stat}" ]; then
+      continue
+    fi
+
+    ## -h file      True if file is a symbolic link.
+    if [ -h "${find_list_item}" ]; then
+      ## https://forums.whonix.org/t/disable-suid-binaries/7706/14
+      log info "Skip symlink: '${find_list_item}'"
+      continue
+    fi
+
+    if [ -d "${find_list_item}" ]; then
+      log info "Skip directory: '${find_list_item}'"
+      continue
+    fi
+
+    ## Remove suid / gid and execute permission for 'group' and 'others'.
+    ## Similar to: chmod og-ugx /path/to/filename
+    ## Removing execution permission is useful to make binaries such as 'su'
+    ## fail closed rather than fail open if suid was removed from these.
+    ## Do not remove read access since no security benefit and easier to
+    ## manually undo for users.
+    ## Are there suid or sgid binaries which are still useful if suid / sgid
+    ## has been removed from these?
+    local new_mode
+    new_mode='744'
+
+    add_to_policy "${file_name_from_stat}" "${new_mode}" "${existing_owner}" \
+      "${existing_group}"
+  done < <(safe_echo_nonewline "${target_file}" \
+    | find -files0-from - -perm /u=s,g=s -print0)
+}
+
+## If the "target file" matches the start of the state file name, that's a
+## likely match. This is used by load_late_nosuid_policy for detecting info
+## about files that need SUID-locked that are in the state.
+match_dir() {
+  local base_str match_str base_arr match_arr base_idx
+
+  base_str="${1}"
+  match_str="${2}"
+  [[ "${base_str}" =~ '//' ]] && return 1
+  [[ "${match_str}" =~ '//' ]] && return 1
+
+  IFS='/' read -r -a base_arr <<< "${base_str}"
+  IFS='/' read -r -a match_arr <<< "${match_str}"
+  (( ${#base_arr[@]} > ${#match_arr[@]} )) && return 1
+
+  for (( base_idx=0; base_idx < ${#base_arr[@]}; base_idx++ )); do
+    if [ "${base_arr[base_idx]}" != "${match_arr[base_idx]}" ]; then
+      return 1
+    fi
+  done
+
+  return 0
+}
+
+load_late_nosuid_policy() {
+  local target_file state_idx state_file_item state_user_owner_item \
+    state_group_owner_item new_mode
+
+  target_file="${1:-}"
+  for (( state_idx=0; state_idx < ${#state_file_list[@]}; state_idx++ )); do
+    state_file_item="${state_file_list[state_idx]}"
+    check_nosuid_whitelist "${state_file_item}" || continue
+
+    match_dir "${target_file}" "${state_file_item}" || continue
+
+    if [ -h "${state_file_item}" ]; then
+      ## https://forums.whonix.org/t/disable-suid-binaries/7706/14
+      log info "Skip symlink: '${state_file_item}'"
+      continue
+    fi
+
+    if [ -d "${state_file_item}" ]; then
+      log info "Skip directory: '${state_file_item}'"
+      continue
+    fi
+
+    state_user_owner_item="${state_user_owner_list[state_idx]}"
+    state_group_owner_item="${state_group_owner_list[state_idx]}"
+    new_mode='744'
+    add_to_policy "${state_file_item}" "${new_mode}" \
+      "${state_user_owner_item}" "${state_group_owner_item}"
+  done
+}
+
+load_state_without_policy() {
+  local line field_list
+
+  ## Load the state file from disk
+  if [ -f "${state_file}" ]; then
+    while read -r line; do
+      read -r -a field_list <<< "${line}"
+      if (( ${#field_list[@]} != 4 )); then
+        log info \
+          "Invalid number of fields in state file line: '${line}'. Skipping."
+        continue
+      fi
+      state_user_owner_list+=( "${field_list[0]}" )
+      state_group_owner_list+=( "${field_list[1]}" )
+      state_mode_list+=( "${field_list[2]}" )
+      state_file_list+=( "${field_list[3]}" )
+    done < "${state_file}"
+  fi
+}
+
+load_state() {
+  ## Config format:
+  ##   path options
+  ## where options is one of:
+  ##   user_owner group_owner filemode [capability-setting]
+  ##   [nosuid|exactwhitelist|matchwhitelist|disablewhitelist]
+  ##
+  ## Additionally, the special value 'whitelists_disable_all=true' is understood
+  ## to mean that all whitelisting should be ignored.
+
+  local config_file line field_list policy_nosuid_file_item policy_file_item
+
+  ## Load configuration, deferring whitelist handling until later
+  for config_file in \
+    /usr/lib/permission-hardener.d/*.conf \
+    /etc/permission-hardener.d/*.conf \
+    /usr/local/etc/permission-hardener.d/*.conf \
+    /etc/permission-hardening.d/*.conf \
+    /usr/local/etc/permission-hardening.d/*.conf
+  do
+    if [ ! -f "${config_file}" ]; then
+      continue
+    fi
+
+    while read -r line; do
+      if [ -z "${line}" ]; then
+        true 'DEBUG: line is empty. Skipping.'
+        continue
+      fi
+
+      if [[ "${line}" =~ ^\s*# ]]; then
+        continue
+      fi
+
+      if ! [[ "${line}" =~ ^[-0-9a-zA-Z._/[:space:]]*$ ]]; then
+        exit_code=200
+        log error "Line contains invalid characters: '${line}'" >&2
+        ## Safer to exit with error in this case.
+        ## https://forums.whonix.org/t/disable-suid-binaries/7706/59
+        exit "${exit_code}"
+      fi
+
+      if [ "${line}" = 'whitelists_disable_all=true' ]; then
+        whitelists_disable_all=true
+        log info "whitelists_disable_all=true"
+        continue
+      fi
+
+      processed_config_line="${line}"
+
+      IFS=' ' read -r -a field_list <<< "${line}"
+
+      case "${#field_list[@]}" in
+        2|4|5) true;;
+        *)
+          exit_code=200
+          log error "Line contains an invalid number of fields: '${line}'" >&2
+          exit "${exit_code}"
+          ;;
+      esac
+
+      # Strip trailing slash if appropriate
+      field_list[0]="${field_list[0]%/}"
+
+      case "${field_list[1]}" in
+        'exactwhitelist')
+          [ ! -e "${field_list[0]}" ] && continue
+          policy_exact_white_list+=( "${field_list[0]}" )
+          continue
+          ;;
+        'matchwhitelist')
+          policy_match_white_list+=( "${field_list[0]}" )
+          continue
+          ;;
+        'disablewhitelist')
+          policy_disable_white_list+=( "${field_list[0]}" )
+          continue
+          ;;
+        'nosuid')
+          [ ! -e "${field_list[0]}" ] && continue
+          policy_nosuid_file_list+=( "${field_list[0]}" )
+          ;;
+        *)
+          [ ! -e "${field_list[0]}" ] && continue
+          add_to_policy "${field_list[@]}"
+          ;;
+      esac
+    done < "${config_file}"
+  done
+
+  ## We have to handle nosuid files at the end since the whitelist arrays need
+  ## built first.
+  for policy_nosuid_file_item in "${policy_nosuid_file_list[@]}"; do
+    load_early_nosuid_policy "${policy_nosuid_file_item}"
+  done
+
+  load_state_without_policy
+
+  ## Find any files in the policy that don't already have a matching file in
+  ## the state. Add those files to the state, and save them to the state file
+  ## as well.
+  for policy_file_item in "${policy_file_list[@]}"; do
+    if [[ " ${state_file_list[*]} " =~ " ${policy_file_item} " ]]; then
+      continue
+    fi
+    output_stat "${policy_file_item}"
+    if [ -z "${file_name_from_stat}" ]; then
+      continue
+    fi
+    state_file_list+=( "${file_name_from_stat}" )
+    state_user_owner_list+=( "${existing_owner}" )
+    state_group_owner_list+=( "${existing_group}" )
+    state_mode_list+=( "${existing_mode}" )
+    # shellcheck disable=SC2086
+    echo_wrapper_audit silent dpkg-statoverride \
+      ${dpkg_admindir_parameter_existing_mode} \
+      --add "${existing_owner}" "${existing_group}" "${existing_mode}" \
+      "${file_name_from_stat}"
+  done
+
+  ## Fix up nosuid policies using state information
+  for policy_nosuid_file_item in "${policy_nosuid_file_list[@]}"; do
+    load_late_nosuid_policy "${policy_nosuid_file_item}"
+  done
+}
+
+apply_policy() {
+  local policy_idx did_state_update state_idx
+
+  ## Modify the in-memory state so that all items that the policy affects match
+  ## the policy. DO NOT save these changes to the state file!
+  for (( policy_idx=0; policy_idx < ${#policy_file_list[@]}; policy_idx++ )); do
+    did_state_update=false
+    for (( state_idx=0; state_idx < ${#state_file_list[@]}; state_idx++ )); do
+      if [ "${state_file_list[state_idx]}" = "${policy_file_list[policy_idx]}" ]; then
+        state_user_owner_list[state_idx]="${policy_user_owner_list[policy_idx]}"
+        state_group_owner_list[state_idx]="${policy_group_owner_list[policy_idx]}"
+        state_mode_list[state_idx]="${policy_mode_list[policy_idx]}"
+        did_state_update=true
+        break
+      fi
+    done
+    if [ "${did_state_update}" = 'false' ]; then
+      exit_code=206
+      log error \
+        "File exists in policy but not in state! File: '${policy_file_list[policy_idx]}'"
+      exit "${exit_code}"
+    fi
+  done
+}
+
+commit_policy() {
+  local policy_idx state_idx state_file_item \
+    state_user_owner_item state_group_owner_item \
+    state_mode_item orig_main_statoverride_db orig_new_statoverride_db \
+    policy_file_item policy_capability_item
+
+  ## Check each file on the filesystem against the state, and update it if the
+  ## state does not match. Also ensure the consistency of the new_mode database
+  ## so that people can compare the original permissions of files with the new
+  ## permissions.
+  orig_main_statoverride_db="$(dpkg-statoverride --list)" || true
+  # shellcheck disable=SC2086
+  orig_new_statoverride_db="$(dpkg-statoverride ${dpkg_admindir_parameter_new_mode} --list)" || true
+
+  for (( state_idx=0; state_idx < ${#state_file_list[@]}; state_idx++ )); do
+    state_file_item="${state_file_list[state_idx]}"
+    state_user_owner_item="${state_user_owner_list[state_idx]}"
+    state_group_owner_item="${state_group_owner_list[state_idx]}"
+    state_mode_item="${state_mode_list[state_idx]}"
+
+    ## Get rid of leading zeros, stat doesn't output them due to how we use it.
+    ## Using BASH_REMATCH is faster than sed. We capture all leading zeros into
+    ## one group, and the rest of the string into a second group. The second
+    ## group is the string we want. BASH_REMATCH[0] is the entire string,
+    ## BASH_REMATCH[1] is the first match that we want to discard, and
+    ## BASH_REMATCH[2] is the desired second group.
+    [[ "${state_mode_item}" =~ ^(0*)(.*) ]] || true;
+    state_mode_item="${BASH_REMATCH[2]}"
+
+    output_stat "${state_file_item}"
+    if [ -z "${file_name_from_stat}" ]; then
+      continue
+    fi
+
+    if [ "${existing_owner}" != "${state_user_owner_item}" ] \
+      || [ "${existing_group}" != "${state_group_owner_item}" ] \
+      || [ "${existing_mode}" != "${state_mode_item}" ]; then
+      if ! [[ "${passwd_file_contents}" =~ "${state_user_owner_item}:" ]]; then
+        log error "Owner from config does not exist: '${state_user_owner_item}'" >&2
+        continue
+      fi
+
+      if ! [[ "${group_file_contents}" =~ "${state_group_owner_item}:" ]]; then
+        log error "Group from config does not exist: '${state_group_owner_item}'" >&2
+        continue
+      fi
+      ## Remove and reapply in main list
+      if [[ "${orig_main_statoverride_db}" =~ "${file_name_from_stat}" ]]; then
+        echo_wrapper_ignore silent dpkg-statoverride --remove \
+          "${file_name_from_stat}"
+      fi
+      echo_wrapper_audit verbose dpkg-statoverride --add --update \
+        "${state_user_owner_item}" "${state_group_owner_item}" \
+        "${state_mode_item}" "${file_name_from_stat}"
+
+      ## Update item in secondary list
+      if [[ "${orig_new_statoverride_db}" =~ "${file_name_from_stat}" ]]; then
+        # shellcheck disable=SC2086
+        echo_wrapper_ignore silent dpkg-statoverride \
+          ${dpkg_admindir_parameter_new_mode} --remove \
+          "${file_name_from_stat}"
+      fi
+      # shellcheck disable=SC2086
+      echo_wrapper_audit verbose dpkg-statoverride \
+        ${dpkg_admindir_parameter_new_mode} --add \
+        "${state_user_owner_item}" "${state_group_owner_item}" \
+        "${state_mode_item}" "${file_name_from_stat}"
+    fi
+  done
+
+  ## Apply capability hardening, dpkg-statoverride can't handle this so we have
+  ## to do this manually
+  for (( policy_idx=0; policy_idx < ${#policy_file_list[@]}; policy_idx++ )); do
+    policy_file_item="${policy_file_list[policy_idx]}"
+    policy_capability_item="${policy_capability_list[policy_idx]}"
+    if [ -z "${policy_capability_item}" ]; then
+      continue
+    fi
+
+    if [ "${policy_capability_item}" = 'none' ]; then
+      echo_wrapper_ignore verbose setcap -r "${policy_file_item}"
+      if [ -n "$(getcap -- "${policy_file_item}")" ]; then
+        exit_code=205
+        log error \
+          "Removing capabilities failed. File: '${policy_file_item}'" >&2
+        continue
+      fi
+    else
+      if ! capsh --print \
+        | grep --fixed-strings -- "Bounding set" \
+        | grep -- "${policy_capability_item}" >/dev/null; then
+        log error \
+          "Capability from config does not exist: '${policy_capability_item}'" \
+          >&2
+        continue
+      fi
+
+      ## feature request: dpkg-statoverride: support for capabilities
+      ## https://bugs.debian.org/cgi-bin/bugreport.cgi?bug=502580
+      echo_wrapper_audit verbose setcap "${policy_capability_item}+ep" \
+        -- "${policy_file_item}"
+    fi
+  done
+
+  log notice "\
+To compare the current and previous permission modes, install 'meld' (or preferred diff tool) for comparison of file mode changes:
+    sudo apt install --no-install-recommends meld
+    meld ${store_dir}/existing_mode/statoverride ${store_dir}/new_mode/statoverride"
+}
+
+undo_policy_for_file() {
+  local undo_file state_idx state_file_item did_undo \
+    undo_all verbose orig_main_statoverride_db orig_new_statoverride_db \
+    state_user_owner_item state_group_owner_item state_mode_item
+
+  undo_file="${1}"
+  undo_all=false
+  verbose='--verbose'
+  if [ "${undo_file}" = 'all' ]; then
+    undo_all=true
+    verbose=''
+  fi
+
+  if [ ! -f "${state_file}" ]; then
+    true 'DEBUG: State file does not exist, hardening was not applied before.'
+    return 0
+  fi
+
+  did_undo=false
+
+  for (( state_idx=0; state_idx < ${#state_file_list[@]}; state_idx++ )); do
+    state_file_item="${state_file_list[state_idx]}"
+    if [ "${undo_all}" = 'true' ]; then
+      undo_file="${state_file_item}"
+    fi
+
+    if [ "${state_file_item}" = "${undo_file}" ]; then
+      orig_main_statoverride_db="$(dpkg-statoverride --list)" || true
+      # shellcheck disable=SC2086
+      orig_new_statoverride_db="$(dpkg-statoverride ${dpkg_admindir_parameter_new_mode} --list)" || true
+
+      if [[ "${orig_main_statoverride_db}" =~ "${undo_file}" ]]; then
+        echo_wrapper_ignore silent dpkg-statoverride --remove \
+          "${undo_file}"
+      fi
+
+      if [[ "${orig_new_statoverride_db}" =~ "${undo_file}" ]]; then
+        # shellcheck disable=SC2086
+        echo_wrapper_ignore silent dpkg-statoverride \
+          ${dpkg_admindir_parameter_new_mode} --remove \
+          "${undo_file}"
+      fi
+
+      if [ -e "${undo_file}" ]; then
+        state_user_owner_item="${state_user_owner_list[state_idx]}"
+        state_group_owner_item="${state_group_owner_list[state_idx]}"
+        state_mode_item="${state_mode_list[state_idx]}"
+        chown ${verbose} -- "${state_user_owner_item}:${state_group_owner_item}" \
+          "${undo_file}" || exit_code=202
+        ## chmod needs to be run after chown since chown removes suid.
+        chmod ${verbose} "${state_mode_item}" "${undo_file}" || exit_code=203
+      else
+        log info "File does not exist: '${undo_file}'"
+      fi
+      did_undo=true
+
+      if [ "${undo_all}" = 'false' ]; then
+        break
+      fi
+    fi
+  done
+
+  if ! [[ "${did_undo}" = 'false' ]]; then
+    log info "The specified file is not hardened, leaving unchanged.
+
+  File '${undo_file}' has not been removed from SUID Disabler and Permission Hardener during this invocation. This is expected if no policy was ever applied to the file before.
+
+  This program expects the full path to the file. Example:
+    $0 disable /usr/bin/newgrp  # absolute path: works
+    $0 disable newgrp           # relative path: does not work
+
+  To remove all:
+    $0 disable all
+
+  This change might not be permanent. For full instructions, see:
+    https://www.kicksecure.com/wiki/SUID_Disabler_and_Permission_Hardener
+
+  To view list of changed by SUID Disabler and Permission Hardener:
+    https://www.kicksecure.com/wiki/SUID_Disabler_and_Permission_Hardener#View_List_of_Permissions_Changed_by_SUID_Disabler_and_Permission_Hardener
+
+  For re-enabling any specific SUID binary:
+    https://www.kicksecure.com/wiki/SUID_Disabler_and_Permission_Hardener#Re-Enable_Specific_SUID_Binaries
+
+  For completely disabling SUID Disabler and Permission Hardener:
+    https://www.kicksecure.com/wiki/SUID_Disabler_and_Permission_Hardener#Disable_SUID_Disabler_and_Permission_Hardener"
+  fi
+}
+
+print_columns() {
+  local format_str bogus_str
+  format_str=''
+  for bogus_str in "$@"; do
+    format_str="${format_str}%s\t"
+  done
+  format_str="${format_str}\n"
+  ## Using a dynamically generated format string on purpose.
+  # shellcheck disable=SC2059
+  printf "${format_str}" "$@"
+}
+
+print_policy() {
+  local policy_idx
+
+  print_columns 'File' 'User' 'Group' 'Mode' 'Capabilities'
+
+  for (( policy_idx=0; policy_idx < ${#policy_file_list[@]}; policy_idx++ )); do
+    print_columns \
+      "${policy_file_list[policy_idx]}" \
+      "${policy_user_owner_list[policy_idx]}" \
+      "${policy_group_owner_list[policy_idx]}" \
+      "${policy_mode_list[policy_idx]}" \
+      "${policy_capability_list[policy_idx]}"
+  done
+}
+
+print_state() {
+  local state_idx
+
+  print_columns 'File' 'User' 'Group' 'Mode'
+  for (( state_idx=0; state_idx < ${#state_file_list[@]}; state_idx++ )); do
+    print_columns \
+      "${state_file_list[state_idx]}" \
+      "${state_user_owner_list[state_idx]}" \
+      "${state_group_owner_list[state_idx]}" \
+      "${state_mode_list[state_idx]}"
+  done
+}
+
+print_raw_policy_config() {
+  local config_file
+  for config_file in \
+    /usr/lib/permission-hardener.d/*.conf \
+    /etc/permission-hardener.d/*.conf \
+    /usr/local/etc/permission-hardener.d/*.conf \
+    /etc/permission-hardening.d/*.conf \
+    /usr/local/etc/permission-hardening.d/*.conf
+  do
+    if [ ! -f "${config_file}" ]; then
+      continue
+    fi
+    echo "*** begin ${config_file} ***"
+    cat "${config_file}"
+    echo "***   end ${config_file} ***"
+  done
+}
+
+print_raw_state() {
+  local state_file
+  for state_file in "${store_dir}/existing_mode/statoverride" \
+    "${store_dir}/new_mode/statoverride"; do
+    echo "*** begin ${state_file} ***"
+    cat "${state_file}"
+    echo "***   end ${state_file} ***"
+  done
+}
+
+print_fs_audit() {
+  local state_idx state_file_item state_user_owner_item state_group_owner_item \
+    state_mode_item
+
+  echo 'Legend:'
+  echo '... - Warning about an unusual, but not necessarily wrong, condition'
+  echo '!!! - Warning about an unusual and definitely wrong condition'
+  echo '*** - File permission data, actual state on filesystem is consistent with policy'
+  echo '^^^ - File permission data, actual state on filesystem is inconsistent with policy'
+  echo 'vvv - File permissions specified by state, always shown after a ^^^ item'
+  echo
+
+  for (( state_idx=0; state_idx < ${#state_file_list[@]}; state_idx++ )); do
+    state_file_item="${state_file_list[state_idx]}"
+    state_user_owner_item="${state_user_owner_list[state_idx]}"
+    state_group_owner_item="${state_group_owner_list[state_idx]}"
+    state_mode_item="${state_mode_list[state_idx]}"
+
+    ## Get rid of leading zeros, stat doesn't output them due to how we use it.
+    ## Using BASH_REMATCH is faster than sed. We capture all leading zeros into
+    ## one group, and the rest of the string into a second group. The second
+    ## group is the string we want. BASH_REMATCH[0] is the entire string,
+    ## BASH_REMATCH[1] is the first match that we want to discard, and
+    ## BASH_REMATCH[2] is the desired second group.
+    [[ "${state_mode_item}" =~ ^(0*)(.*) ]] || true;
+    state_mode_item="${BASH_REMATCH[2]}"
+
+    output_stat "${state_file_item}"
+    if [ -z "${file_name_from_stat}" ]; then
+      echo "... '${file_name_from_stat}' does not exist"
+      continue
+    fi
+
+    if [ "${existing_owner}" != "${state_user_owner_item}" ] \
+      || [ "${existing_group}" != "${state_group_owner_item}" ] \
+      || [ "${existing_mode}" != "${state_mode_item}" ]; then
+      if ! [[ "${passwd_file_contents}" =~ "${state_user_owner_item}:" ]]; then
+        echo "!!! Owner from config does not exist: '${state_user_owner_item}'"
+        continue
+      fi
+
+      if ! [[ "${group_file_contents}" =~ "${state_group_owner_item}:" ]]; then
+        echo "!!! Group from config does not exist: '${state_group_owner_item}'"
+        continue
+      fi
+
+      echo "^^^ ${file_name_from_stat} ${existing_owner}:${existing_group} ${existing_mode}"
+      echo "vvv ${file_name_from_stat} ${state_user_owner_item}:${state_group_owner_item} ${state_mode_item}"
+    else
+      echo "*** ${file_name_from_stat} ${existing_owner}:${existing_group} ${existing_mode}"
+    fi
+  done
+}
+
+reset_global_vars() {
+  ## Global variables
+  policy_file_list=()
+  policy_user_owner_list=()
+  policy_group_owner_list=()
+  policy_mode_list=()
+  policy_capability_list=()
+  policy_exact_white_list=()
+  policy_match_white_list=()
+  policy_disable_white_list=()
+  policy_nosuid_file_list=()
+  state_file_list=()
+  state_user_owner_list=()
+  state_group_owner_list=()
+  state_mode_list=()
+  whitelists_disable_all=false
+  existing_mode=''
+  existing_owner=''
+  existing_group=''
+  processed_config_line=''
+  file_name_from_stat=''
+  passwd_file_contents="$(getent passwd)"
+  group_file_contents="$(getent group)"
+  exit_code=0
+}
+
+reset_global_vars
+
+## Setup and sanity checking
+if [ "$(id -u)" != '0' ]; then
+  log error "Not running as root, aborting."
+  exit 1
+fi
+
+mkdir --parents "${store_dir}/existing_mode"
+mkdir --parents "${store_dir}/new_mode"
+
+echo_wrapper_audit silent which capsh getcap setcap stat find \
+  dpkg-statoverride getent grep 1>/dev/null
+
+## Command parsing and execution
+case "${1:-}" in
+  enable)
+    shift
+    load_state
+    apply_policy
+    commit_policy
+    ;;
+  disable)
+    shift
+    case "${1:-}" in
+      "")
+        print_usage
+        exit 1
+        ;;
+      *)
+        load_state_without_policy
+        undo_policy_for_file "${1}"
+        ;;
+    esac
+    ;;
+  print-policy)
+    load_state
+    print_policy
+    ;;
+  print-state)
+    load_state
+    print_state
+    ;;
+  print-policy-applied-state)
+    load_state
+    apply_policy
+    print_state
+    ;;
+  print-diagnostics)
+    echo '=== BEGIN PERMISSION-HARDENER DIAGNOSTICS ==='
+
+    echo '--- BEGIN State without policy ---'
+    load_state_without_policy
+    print_state
+    echo '---   END State without policy ---'
+
+    reset_global_vars
+
+    echo '--- BEGIN Policy without state ---'
+    load_state
+    print_policy
+    echo '---   END Policy without state ---'
+
+    reset_global_vars
+
+    echo '--- BEGIN Policy-applied-state ---'
+    load_state
+    apply_policy
+    print_state
+    echo '---   END Policy-applied state ---'
+
+    reset_global_vars
+
+    echo '--- BEGIN Master dpkg-statoverride database ---'
+    dpkg-statoverride --list
+    echo '---   END Master dpkg-statoverride database ---'
+
+    echo '--- BEGIN Raw policy configuration ---'
+    print_raw_policy_config
+    echo '---   END Raw policy configuration ---'
+
+    echo '--- BEGIN Raw state data ---'
+    print_raw_state
+    echo '---   END Raw state data ---'
+
+    echo '--- BEGIN Filesystem state audit ---'
+    load_state
+    apply_policy
+    print_fs_audit
+    echo '---   END Filesystem state audit ---'
+
+    echo '===  END PERMISSION-HARDENER DIAGNOSTICS ==='
+    ;;
+  -h|--help)
+    print_usage
+    exit 0
+    ;;
+  *)
+    print_usage
+    exit 1
+    ;;
+esac
+
+## Exit
+if test "${exit_code}" != "0"; then
+  log error "Exiting with non-zero exit code: '${exit_code}'" >&2
+fi
+
+exit "${exit_code}"

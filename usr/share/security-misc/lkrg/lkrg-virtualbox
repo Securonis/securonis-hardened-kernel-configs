@@ -1,0 +1,35 @@
+#!/bin/bash
+
+## Copyright (C) 2021 - 2025 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
+## See the file COPYING for copying conditions.
+
+#set -x
+set -e
+
+## provides function: pkg_installed
+source /usr/libexec/helper-scripts/package_installed_check.bsh
+
+## Check if the VirtualBox host software is installed.
+if ! command -v vboxmanage &>/dev/null ; then
+   ## VirtualBox host software is not installed.
+   if test -f /etc/sysctl.d/30-lkrg-virtualbox.conf ; then
+      ## Delete using '--verbose' so user is notified.
+      rm --force --verbose /etc/sysctl.d/30-lkrg-virtualbox.conf
+   fi
+   exit 0
+fi
+
+if ! test -d /etc/sysctl.d ; then
+   exit 0
+fi
+
+if ! test -f /usr/share/security-misc/lkrg/30-lkrg-virtualbox.conf ; then
+   exit 0
+fi
+
+if ! pkg_installed "lkrg" ; then
+   exit 0
+fi
+
+## Delete using '--verbose' so user is notified.
+cp --verbose /usr/share/security-misc/lkrg/30-lkrg-virtualbox.conf /etc/sysctl.d/30-lkrg-virtualbox.conf

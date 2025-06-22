@@ -1,0 +1,36 @@
+## Copyright (C) 2019 - 2025 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
+## See the file COPYING for copying conditions.
+
+[Unit]
+Description=remount /home /tmp /dev/shm /run with nosuid,nodev (default) and noexec (opt-in)
+Documentation=https://github.com/Kicksecure/security-misc
+
+ConditionKernelCommandLine=!remountsecure=0
+
+DefaultDependencies=no
+
+Before=sysinit-post.target
+Before=basic.target
+Before=multi-user.target
+Before=graphical.target
+Before=getty-pre.target
+Before=network-pre.target
+
+After=local-fs.target
+After=sysinit.target
+After=qubes-sysinit.service
+
+Requires=local-fs.target
+Requires=sysinit.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Varsayılan seviye 3'ten 2'ye düşürüldü
+# Seviye 2: /home hariç çoğu dizinde nosuid,nodev,noexec ayarları kullanılır
+# /home dizini için sadece nosuid,nodev (noexec olmadan)
+# Böylece home dizininde script ve uygulamalar çalıştırılabilir
+ExecStart=remount-secure 2
+
+[Install]
+WantedBy=sysinit-post.target

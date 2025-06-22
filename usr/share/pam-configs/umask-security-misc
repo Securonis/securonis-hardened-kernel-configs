@@ -1,0 +1,9 @@
+Name: Restrict umask to 027 for non-root users (by package security-misc)
+Default: yes
+Priority: 100
+Session-Type: Additional
+Session:
+	[success=1 default=ignore]	pam_succeed_if.so uid eq 0
+	optional	pam_umask.so umask=027
+	[success=1 default=ignore]	pam_succeed_if.so uid ne 0
+	optional	pam_umask.so umask=022
