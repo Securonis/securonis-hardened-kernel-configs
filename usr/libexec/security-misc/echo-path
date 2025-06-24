@@ -1,8 +1,0 @@
-#!/bin/bash
-
-## Copyright (C) 2019 - 2025 ENCRYPTED SUPPORT LLC <adrelanos@whonix.org>
-## See the file COPYING for copying conditions.
-
-set -e
-
-echo "$PATH"
