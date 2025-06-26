@@ -3,7 +3,7 @@ However, I made significant modifications to improve performance and optimize it
 This configuration provides basic to intermediate level protection rather than strict security.
 Thus, it aims to reduce issues for users during everyday usage. 
 These settings are quite comprehensive for a distribution focused on daily use and aim to offer a reasonable balance between security and performance.
-
+ 
 
 ---------------------------------------------------------------------------------------------------
 
